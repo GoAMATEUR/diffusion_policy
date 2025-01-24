@@ -1,4 +1,13 @@
-from typing import Dict
+'''
+Author: Si-Yuan Huang siyuan.huang@quantgroup.com
+Date: 2025-01-13 11:13:54
+LastEditors: Si-Yuan Huang
+LastEditTime: 2025-01-24 12:12:36
+FilePath: /diffusion_policy/diffusion_policy/policy/diffusion_unet_policy.py
+Description: 1. Added 2 layer MLP for low-dim observation.
+
+'''
+from typing import Dict, Union, Optional, Tuple
 import math
 import torch
 import torch.nn as nn
@@ -10,130 +19,117 @@ from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
-from diffusion_policy.common.robomimic_config_util import get_robomimic_config
-from robomimic.algo import algo_factory
-from robomimic.algo.algo import PolicyAlgo
-import robomimic.utils.obs_utils as ObsUtils
-import robomimic.models.base_nets as rmbn
-import diffusion_policy.model.vision.crop_randomizer as dmvc
+# from diffusion_policy.common.robomimic_config_util import get_robomimic_config
+# from robomimic.algo import algo_factory
+# from robomimic.algo.algo import PolicyAlgo
+# import robomimic.utils.obs_utils as ObsUtils
+# import robomimic.models.base_nets as rmbn
+# import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 
 
+# Vision Encoder:
+# from bos_learning.policy.observation.diffusion_rgb_encoder import DiffusionRgbEncoder
+# from bos_learning.policy.observation.state_mlp_encoder import StateMlpEncoder
+from diffusion_policy.model.observation.base_obs_encoder import BaseObsEncoder
+# from bos_learning.dataset.common.shape_meta_parser import parse_shape_meta
+import hydra
+
+
+def parse_shape_meta(shape_meta: dict):
+    """shape_meta:
+    {
+        "obs": {
+            "observation_states_xxx": {
+                "shape": [10],
+                "type": "low_dim",
+                "hz": 200
+            },
+            "observation_images_xxx": {
+                "shape": [100, 100, 3],
+                "type": "rgb",
+                "hz": 30
+            },
+        "action": {
+            "shape": [10],
+            "type": "float32",
+            "hz": 200
+        }
+    }
+
+    Args:
+        shape_meta (_type_): _description_
+    """
+    state_shape_meta = {}
+    image_shape_meta = {}
+    obs_shape_meta = shape_meta['obs']
+ 
+    for key, attr in obs_shape_meta.items():
+        type = attr.get('type', 'low_dim')
+        if type == 'rgb':
+            image_shape_meta[key] = attr['shape']
+        elif type == 'low_dim':
+            state_shape_meta[key] = attr['shape']
+        else:
+            raise RuntimeError(f"Unsupported obs type: {type}")
+    action_shape = shape_meta['action']['shape']
+    return state_shape_meta, image_shape_meta, action_shape
+
+
 class DiffusionUnetPolicy(BaseImagePolicy):
-    def __init__(self, 
-            shape_meta: dict,
-            noise_scheduler: DDPMScheduler,
-            horizon, 
-            n_action_steps, 
-            n_obs_steps,
-            num_inference_steps=None,
-            obs_as_global_cond=True,
-            crop_shape=(76, 76),
-            diffusion_step_embed_dim=256,
-            down_dims=(256,512,1024),
-            kernel_size=5,
-            n_groups=8,
-            cond_predict_scale=True,
-            obs_encoder_group_norm=False,
-            eval_fixed_crop=False,
-            # parameters passed to step
-            **kwargs):
+    def __init__(self,
+        shape_meta: dict,
+        encoder_meta: dict,
+        noise_scheduler,
+        # task params
+        horizon: int,
+        n_action_steps: int, 
+        n_obs_steps: int,
+        num_inference_steps: Optional[int]=None,
+        # Model
+        diffusion_step_embed_dim: int=256,
+        # lowdim_embed_dims: int=(256, 32),
+        down_dims: Tuple[int, int, int]=(256,512,1024),
+        kernel_size=5,
+        n_groups=8,
+        cond_predict_scale=True,
+        # parameters passed to step
+        **kwargs
+    ):
         super().__init__()
 
-        # parse shape_meta
-        action_shape = shape_meta['action']['shape']
-        assert len(action_shape) == 1
-        action_dim = action_shape[0]
-        obs_shape_meta = shape_meta['obs']
-        obs_config = {
-            'low_dim': [],
-            'rgb': [],
-            'depth': [],
-            'scan': []
-        }
-        obs_key_shapes = dict()
-        for key, attr in obs_shape_meta.items():
-            shape = attr['shape']
-            obs_key_shapes[key] = list(shape)
-
-            type = attr.get('type', 'low_dim')
-            if type == 'rgb':
-                obs_config['rgb'].append(key)
-            elif type == 'low_dim':
-                obs_config['low_dim'].append(key)
-            else:
-                raise RuntimeError(f"Unsupported obs type: {type}")
-
-        # get raw robomimic config
-        config = get_robomimic_config(
-            algo_name='bc_rnn',
-            hdf5_type='image',
-            task_name='square',
-            dataset_type='ph')
+        # ========parse shape_meta=========
+        state_shape_meta, image_shape_meta, action_shape = \
+            parse_shape_meta(shape_meta)
         
-        with config.unlocked():
-            # set config with shape_meta
-            config.observation.modalities.obs = obs_config
-
-            if crop_shape is None:
-                for key, modality in config.observation.encoder.items():
-                    if modality.obs_randomizer_class == 'CropRandomizer':
-                        modality['obs_randomizer_class'] = None
-            else:
-                # set random crop parameter
-                ch, cw = crop_shape
-                for key, modality in config.observation.encoder.items():
-                    if modality.obs_randomizer_class == 'CropRandomizer':
-                        modality.obs_randomizer_kwargs.crop_height = ch
-                        modality.obs_randomizer_kwargs.crop_width = cw
-
-        # init global state
-        ObsUtils.initialize_obs_utils_with_config(config)
-
-        # load model
-        policy: PolicyAlgo = algo_factory(
-                algo_name=config.algo_name,
-                config=config,
-                obs_key_shapes=obs_key_shapes,
-                ac_dim=action_dim,
-                device='cpu',
-            )
-
-        obs_encoder = policy.nets['policy'].nets['encoder'].nets['obs']
-        
-        if obs_encoder_group_norm:
-            # replace batch norm with group norm
-            replace_submodules(
-                root_module=obs_encoder,
-                predicate=lambda x: isinstance(x, nn.BatchNorm2d),
-                func=lambda x: nn.GroupNorm(
-                    num_groups=x.num_features//16, 
-                    num_channels=x.num_features)
-            )
-            # obs_encoder.obs_nets['agentview_image'].nets[0].nets
-        
-        # obs_encoder.obs_randomizers['agentview_image']
-        if eval_fixed_crop:
-            replace_submodules(
-                root_module=obs_encoder,
-                predicate=lambda x: isinstance(x, rmbn.CropRandomizer),
-                func=lambda x: dmvc.CropRandomizer(
-                    input_shape=x.input_shape,
-                    crop_height=x.crop_height,
-                    crop_width=x.crop_width,
-                    num_crops=x.num_crops,
-                    pos_enc=x.pos_enc
-                )
-            )
-
-        # create diffusion model
-        obs_feature_dim = obs_encoder.output_shape()[0]
-        input_dim = action_dim + obs_feature_dim
-        global_cond_dim = None
-        if obs_as_global_cond:
-            input_dim = action_dim
-            global_cond_dim = obs_feature_dim * n_obs_steps
-
+        # 3. prepare obs encoder and accumulate obs feature dim
+        # TODO: Put this into a unified class.
+        obs_feature_single_dim = 0 # accumulator for obs feature dim
+        obs_encoder_dict = {}
+        if len(image_shape_meta) > 0:
+            for key in image_shape_meta:
+                this_encoder_cls = hydra.utils.get_class(encoder_meta.images.encoder_type)
+                this_obs_encoder: BaseObsEncoder = this_encoder_cls(**encoder_meta.images)
+                obs_encoder_dict[key] = this_obs_encoder
+                obs_feature_single_dim += this_obs_encoder.feature_dim
+                print(f"[Policy] obs_feature_single_dim: {key}: {this_obs_encoder.feature_dim}")
+        if len(state_shape_meta) > 0:
+            for key in state_shape_meta:
+                # Create MLP layers dynamically
+                this_encoder_cls = hydra.utils.get_class(encoder_meta.states.encoder_type)
+                this_obs_encoder: BaseObsEncoder = this_encoder_cls(
+                    input_shape=state_shape_meta[key][0], **encoder_meta.states)
+                obs_encoder_dict[key] = this_obs_encoder
+                obs_feature_single_dim += this_obs_encoder.feature_dim
+                print(f"[Policy] obs_feature_single_dim: {key}: {this_obs_encoder.feature_dim}")
+        global_cond_dim = obs_feature_single_dim * n_obs_steps
+        # self.global_cond_dim = global_cond_dim
+        self.obs_feature_single_dim = obs_feature_single_dim
+        self.obs_encoder_dict = nn.ModuleDict(obs_encoder_dict)
+        print("[Policy] global_cond_dim: ", global_cond_dim)
+        print("[Policy] obs_feature_single_dim: ", obs_feature_single_dim)
+        # ========Prepare Unet=========
+        input_dim = action_shape[0] # unet input
         model = ConditionalUnet1D(
             input_dim=input_dim,
             local_cond_dim=None,
@@ -144,33 +140,40 @@ class DiffusionUnetPolicy(BaseImagePolicy):
             n_groups=n_groups,
             cond_predict_scale=cond_predict_scale
         )
-
-        self.obs_encoder = obs_encoder
         self.model = model
         self.noise_scheduler = noise_scheduler
+        self.obs_as_global_cond = True
         self.mask_generator = LowdimMaskGenerator(
-            action_dim=action_dim,
-            obs_dim=0 if obs_as_global_cond else obs_feature_dim,
+            action_dim=action_shape[0],
+            obs_dim=0 if self.obs_as_global_cond else obs_feature_single_dim,
             max_n_obs_steps=n_obs_steps,
             fix_obs_steps=True,
             action_visible=False
-        )
+        ) # TODO: del
         self.normalizer = LinearNormalizer()
         self.horizon = horizon
-        self.obs_feature_dim = obs_feature_dim
-        self.action_dim = action_dim
+        self.obs_feature_dim = obs_feature_single_dim
+        self.action_dim = input_dim
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
-        self.obs_as_global_cond = obs_as_global_cond
         self.kwargs = kwargs
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
 
-        print("Diffusion params: %e" % sum(p.numel() for p in self.model.parameters()))
-        print("Vision params: %e" % sum(p.numel() for p in self.obs_encoder.parameters()))
-    
+        print("[Policy] Diffusion params: %e" % sum(p.numel() for p in self.model.parameters()))
+        print("[Policy] obs_encoder params: %e" % sum(p.numel() for p in self.obs_encoder_dict.parameters()))
+
+    def _prepare_global_cond(self, nobs_dict: Dict[str, torch.Tensor]):
+        # TODO: handle different ways of passing observation
+        global_cond = []
+        for key, value in nobs_dict.items():
+            global_cond.append(self.obs_encoder_dict[key](value))
+        global_cond = torch.cat(global_cond, dim=-1) # (B*T, D)
+        assert global_cond.shape[-1] == self.obs_feature_single_dim
+        return global_cond
+
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, condition_mask,
@@ -237,8 +240,9 @@ class DiffusionUnetPolicy(BaseImagePolicy):
         if self.obs_as_global_cond:
             # condition through global feature
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, Do
+            # get global feature
+            # nobs_features = self.obs_encoder(this_nobs)
+            nobs_features = self._prepare_global_cond(this_nobs)
             global_cond = nobs_features.reshape(B, -1)
             # empty data for action
             cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
@@ -298,7 +302,9 @@ class DiffusionUnetPolicy(BaseImagePolicy):
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
                 lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            # nobs_features = self.obs_encoder(this_nobs)
+            # global_cond = nobs_features.reshape(batch_size, -1)
+            nobs_features = self._prepare_global_cond(this_nobs)
             # reshape back to B, Do
             global_cond = nobs_features.reshape(batch_size, -1)
         else:
